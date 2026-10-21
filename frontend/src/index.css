@@ -1,0 +1,39 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  background-color: #0B0F14;
+}
+
+body {
+  font-family: "IBM Plex Sans", sans-serif;
+  color: #E6EDF3;
+}
+
+/* Faint blueprint grid used behind the 3D viewport */
+.blueprint-grid {
+  background-image:
+    linear-gradient(to right, #1E2733 1px, transparent 1px),
+    linear-gradient(to bottom, #1E2733 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: #0E141F;
+}
+::-webkit-scrollbar-thumb {
+  background: #233040;
+  border-radius: 4px;
+}
+
+.readout {
+  font-family: "IBM Plex Mono", monospace;
+  font-variant-numeric: tabular-nums;
+}
