@@ -1,6 +1,7 @@
 import React, { useCallback, useState } from "react";
 import ReactDOM from "react-dom/client";
 import TerrainScene, { SiteData, BuildingMesh, CameraView } from "./components/TerrainScene";
+import MapPicker from "./components/MapPicker";
 import "./styles.css";
 
 /** Collapsible sidebar section — data stays hidden until the user opens it. */
@@ -59,6 +60,36 @@ function App() {
   const [error, setError] = useState("");
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [mapOpen, setMapOpen] = useState(false);
+  const [fetchingLoc, setFetchingLoc] = useState(false);
+
+  /** Shared loader: both DXF upload and satellite fetch return the same payload shape. */
+  const loadPayload = async (r: Response) => {
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({ detail: r.statusText }));
+      setError(e.detail ?? "Could not build the terrain.");
+      return;
+    }
+    setData(await r.json());
+    setBuilding(null);
+    setPlaceMode(false);
+  };
+
+  const onPickLocation = useCallback(async (lat: number, lon: number, halfM: number) => {
+    setError("");
+    setFetchingLoc(true);
+    try {
+      const r = await fetch("/api/fetch-location", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat, lon, half_m: halfM }),
+      });
+      await loadPayload(r);
+      if (r.ok) setMapOpen(false);
+    } finally {
+      setFetchingLoc(false);
+    }
+  }, []);
 
   const onFile = async (f: File) => {
     if (!f.name.toLowerCase().endsWith(".dxf")) {
@@ -121,15 +152,24 @@ function App() {
           <p className="sub">True-scale 3D land analysis for architects</p>
         </header>
 
-        {/* STEP 1 — survey */}
+        {/* STEP 1 — survey: DXF upload OR satellite location pick */}
         <div className="step">
           <span className={`step-num ${data ? "done" : ""}`}>{data ? "✓" : "1"}</span>
-          <label className="btn primary">
-            {uploading ? <><span className="spinner" /> Processing…</>
-                       : data ? "Load another DXF survey" : "Upload DXF survey"}
-            <input type="file" accept=".dxf" hidden disabled={uploading}
-                   onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
-          </label>
+          <div className="step-actions">
+            <label className="btn primary">
+              {uploading ? <><span className="spinner" /> Processing…</>
+                         : data ? "Load another DXF survey" : "Upload DXF survey"}
+              <input type="file" accept=".dxf" hidden disabled={uploading}
+                     onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
+            </label>
+            <button className="btn" onClick={() => setMapOpen(true)}>
+              Pick location on map
+            </button>
+          </div>
+          <p className="hint small">
+            No survey yet? Choose a plot on the satellite map and we will fetch real
+            elevation (Copernicus GLO‑30) instantly.
+          </p>
         </div>
 
         {error && <p className="error">{error}</p>}
@@ -270,7 +310,8 @@ function App() {
         ) : (
           <div className="empty">
             <h2>See your land in true-scale 3D</h2>
-            <p>Upload a DXF land survey to build an accurate terrain model.<br />
+            <p>Upload a DXF land survey to build an accurate terrain model — or pick a
+               plot on the satellite map to fetch real elevation instantly.<br />
                Then optionally drop your building (IFC) onto it.</p>
             <label className={`dropzone ${dragOver ? "drag" : ""}`}>
               <span className="big">{uploading ? "Processing survey…" : "Drop DXF here or click to browse"}</span>
@@ -278,9 +319,14 @@ function App() {
               <input type="file" accept=".dxf" hidden disabled={uploading}
                      onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
             </label>
+            <button className="btn" onClick={() => setMapOpen(true)}>
+              Or pick location on satellite map
+            </button>
           </div>
         )}
       </main>
+
+      {mapOpen && <MapPicker onPick={onPickLocation} busy={fetchingLoc} />}
     </div>
   );
 }

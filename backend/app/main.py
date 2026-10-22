@@ -167,6 +167,84 @@ async def upload(file: UploadFile = File(...)):
     return payload
 
 
+@app.post("/api/fetch-location")
+async def fetch_location(body: dict):
+    """Build a terrain model from real Copernicus GLO-30 elevation data.
+
+    The user picks a point on the satellite map in the frontend; we sample a
+    DEM grid around it, convert it to survey-style points (local metres,
+    float64 elevations) and run the SAME TIN/contour/boundary pipeline used
+    for DXF uploads -- so both input paths produce identical output shapes.
+    """
+    try:
+        lat = float(body.get("lat"))
+        lon = float(body.get("lon"))
+    except (TypeError, ValueError):
+        raise HTTPException(422, "Provide numeric lat and lon.")
+    if not (-89 < lat < 90 and -180 < lon < 180):
+        raise HTTPException(422, "lat must be in (-90, 90), lon in (-180, 180).")
+    half_m = min(max(float(body.get("half_m", 150.0)), 30.0), 1000.0)
+
+    from .dem import fetch_grid
+    try:
+        grid = fetch_grid(lat, lon, half_m=half_m)
+    except ImportError:
+        raise HTTPException(501, "DEM support not installed (pip install rasterio mercantile).")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"Could not fetch elevation data: {e}")
+
+    # reproject lon/lat -> local ENU metres about the picked centre
+    lons = np.asarray(grid["lons"], dtype=np.float64)
+    lats = np.asarray(grid["lats"], dtype=np.float64)
+    elev = np.asarray(grid["elev"], dtype=np.float64)
+    x = (lons - lon) * 111_320.0 * math.cos(math.radians(lat))
+    y = (lats - lat) * 111_320.0
+
+    pts = np.stack([x, y, elev], axis=1)
+    tin = build_tin(pts)
+    stats = compute_stats(tin)
+    pid = uuid.uuid4().hex[:12]
+    with open(os.path.join(_project_dir(pid), "tin.json"), "w") as f:
+        json.dump({
+            "points_xy": np.asarray(tin["points_xy"]).tolist(),
+            "z": np.asarray(tin["z"]).tolist(),
+            "simplices": np.asarray(tin["simplices"]).tolist(),
+        }, f)
+    interval = dynamic_contour_interval(stats)
+    levels = [math.ceil(stats["min_elev"] / interval) * interval + i * interval
+              for i in range(int(math.floor(stats["relief"] / interval)) + 1)]
+    contours = extract_contours(tin["points_xy"], tin["z"], tin["simplices"], levels)
+    boundary = _boundary_from_tin(tin)
+    area, perimeter = _area_perimeter(boundary)
+
+    payload = {
+        "id": pid,
+        "name": f"Satellite site ({lat:.4f}, {lon:.4f})",
+        "source": "copernicus_glo30",
+        "units_hint": "m",
+        "warnings": [
+            "Elevation from Copernicus GLO-30 DEM (~30 m resolution) -- "
+            "good for feasibility-level visualisation, not survey-grade.",
+            "Vertical datum is height above sea level (MSL-equivalent).",
+        ],
+        "layers": ["DEM"],
+        "skipped_layers": [],
+        "stats": stats,
+        "contour_interval": interval,
+        "contours": contours,
+        "boundary": boundary,
+        "area_m2": area,
+        "perimeter_m": perimeter,
+        "centre_lat": lat,
+        "centre_lon": lon,
+    }
+    with open(os.path.join(_project_dir(pid), "site.json"), "w") as f:
+        json.dump(payload, f)
+    return payload
+
+
 def _boundary_from_tin(tin) -> list[list[float]]:
     """Edge-aware site boundary.
 
