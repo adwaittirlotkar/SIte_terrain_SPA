@@ -176,6 +176,7 @@ async def fetch_location(body: dict):
     float64 elevations) and run the SAME TIN/contour/boundary pipeline used
     for DXF uploads -- so both input paths produce identical output shapes.
     """
+    polygon = body.get("polygon")  # optional [[lat, lon], ...] drawn by user
     try:
         lat = float(body.get("lat"))
         lon = float(body.get("lon"))
@@ -185,9 +186,14 @@ async def fetch_location(body: dict):
         raise HTTPException(422, "lat must be in (-90, 90), lon in (-180, 180).")
     half_m = min(max(float(body.get("half_m", 150.0)), 30.0), 1000.0)
 
-    from .dem import fetch_grid
+    use_polygon = isinstance(polygon, list) and len(polygon) >= 3
+    from .dem import fetch_grid, fetch_grid_for_polygon
     try:
-        grid = fetch_grid(lat, lon, half_m=half_m)
+        if use_polygon:
+            polygon = [[float(a), float(b)] for a, b in polygon]
+            grid = fetch_grid_for_polygon(polygon)
+        else:
+            grid = fetch_grid(lat, lon, half_m=half_m)
     except ImportError:
         raise HTTPException(501, "DEM support not installed (pip install rasterio mercantile).")
     except ValueError as e:
@@ -202,7 +208,28 @@ async def fetch_location(body: dict):
     x = (lons - lon) * 111_320.0 * math.cos(math.radians(lat))
     y = (lats - lat) * 111_320.0
 
-    pts = np.stack([x, y, elev], axis=1)
+    if use_polygon and "mask" in grid:
+        # keep only samples inside the drawn polygon -> terrain matches the draw
+        m = np.asarray(grid["mask"], dtype=bool) & np.isfinite(elev)
+        if m.sum() < 10:
+            raise HTTPException(422, "Drawn polygon is too small — zoom in and draw a larger plot.")
+        X, Y, Z = x[m], y[m], elev[m]
+        # add the exact polygon corners (elevations sampled from DEM) so the
+        # boundary follows the drawn outline precisely
+        plons = np.array([p[1] for p in polygon]); plats = np.array([p[0] for p in polygon])
+        px = (plons - lon) * 111_320.0 * math.cos(math.radians(lat))
+        py = (plats - lat) * 111_320.0
+        # sample corner elevations from the nearest interior points
+        from scipy.interpolate import griddata
+        corner_z = griddata(np.stack([X, Y], axis=1), Z,
+                            np.stack([px, py], axis=1), method="nearest")
+        X = np.concatenate([X, px]); Y = np.concatenate([Y, py])
+        Z = np.concatenate([Z, np.where(np.isfinite(corner_z), corner_z, np.median(Z))])
+        pts = np.stack([X, Y, Z], axis=1)
+        site_name = f"Satellite site ({lat:.4f}, {lon:.4f}) — drawn polygon"
+    else:
+        pts = np.stack([x, y, elev], axis=1)
+        site_name = f"Satellite site ({lat:.4f}, {lon:.4f})"
     tin = build_tin(pts)
     stats = compute_stats(tin)
     pid = uuid.uuid4().hex[:12]
@@ -221,7 +248,7 @@ async def fetch_location(body: dict):
 
     payload = {
         "id": pid,
-        "name": f"Satellite site ({lat:.4f}, {lon:.4f})",
+        "name": site_name,
         "source": "copernicus_glo30",
         "units_hint": "m",
         "warnings": [

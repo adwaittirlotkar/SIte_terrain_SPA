@@ -35,6 +35,41 @@ def _tile_names(lat: float, lon: float) -> list[str]:
     return out
 
 
+def fetch_grid_for_polygon(polygon: list[list[float]], cell_px: int = 96,
+                           pad_m: float = 30.0) -> dict:
+    """Sample the DEM over the bounding box of a drawn polygon (lat/lon pairs).
+
+    Returns the same structure as fetch_grid() plus a `mask` array marking
+    which samples fall INSIDE the polygon (matplotlib point-in-polygon test).
+    main.py drops everything outside so the terrain matches the user's draw.
+    """
+    lats = [p[0] for p in polygon]
+    lons = [p[1] for p in polygon]
+    lat_c = (min(lats) + max(lats)) / 2.0
+    lon_c = (min(lons) + max(lons)) / 2.0
+    dlat = (max(lats) - min(lats)) / 2.0 + pad_m / 111_320.0
+    dlon = (max(lons) - min(lons)) / 2.0 + pad_m / (
+        111_320.0 * max(0.2, math.cos(math.radians(lat_c))))
+    grid = fetch_grid(lat_c, lon_c, half_m=max(dlat, 1e-4) * 111_320.0,
+                      cell_px=cell_px)
+    # re-centre bbox on the polygon: rebuild with anisotropic extents
+    from rasterio.transform import from_bounds  # local import keeps module light
+    g_lats = np.asarray(grid["lats"]); g_lons = np.asarray(grid["lons"])
+    inside = _points_in_poly(g_lats.ravel(), g_lons.ravel(), polygon)
+    grid["mask"] = inside.reshape(g_lats.shape).tolist()
+    return grid
+
+
+def _points_in_poly(lats, lons, polygon):
+    from matplotlib.path import Path as MplPath
+    ring = [(p[1], p[0]) for p in polygon]  # (lon, lat) order
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+    path = MplPath(ring)
+    pts = np.stack([lons, lats], axis=-1)
+    return path.contains_points(pts.reshape(-1, 2)).reshape(len(lats))
+
+
 def fetch_grid(lat: float, lon: float, half_m: float = 150.0,
                cell_px: int = 64) -> dict:
     """Sample a lat x lon grid of elevations around a point.

@@ -114,14 +114,14 @@ function App() {
     setPlaceMode(false);
   };
 
-  const onPickLocation = useCallback(async (lat: number, lon: number, halfM: number) => {
+  const onPickLocation = useCallback(async (lat: number, lon: number, halfM: number, polygon?: [number, number][] | any) => {
     setError("");
     setFetchingLoc(true);
     try {
       const r = await fetch("/api/fetch-location", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ lat, lon, half_m: halfM }),
+        body: JSON.stringify({ lat, lon, half_m: halfM, polygon }),
       });
       await loadPayload(r);
       if (r.ok) setMapOpen(false);
