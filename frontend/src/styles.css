@@ -198,3 +198,34 @@ table.kv tr:last-child td { border-bottom: 0; }
 .hint.small { font-size: .78rem; opacity: .7; margin-top: 8px; }
 .step-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .empty .btn { margin-top: 12px; }
+
+/* --- Landing choice cards (DXF upload vs map select) --- */
+.choice-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 320px));
+  gap: 16px; margin-top: 28px;
+}
+.choice-card {
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  gap: 10px; padding: 28px 22px; cursor: pointer;
+  background: var(--panel, #141a22); border: 1.5px dashed var(--border, #26303c);
+  border-radius: 16px; color: var(--text, #e6edf3); font: inherit;
+  transition: border-color .15s, background .15s, transform .15s;
+}
+.choice-card:hover, .choice-card.drag {
+  border-color: var(--accent); background: rgba(77,163,255,.06); transform: translateY(-2px);
+}
+.choice-icon { font-size: 34px; line-height: 1; }
+.choice-title { font-size: 16px; font-weight: 800; color: var(--accent); }
+.choice-desc { font-size: 12.5px; color: var(--muted); line-height: 1.5; max-width: 260px; }
+
+/* --- Slope distribution mini chart --- */
+.slope-chart { margin-top: 12px; }
+.chart-title {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .6px; color: var(--muted); margin: 0 0 8px;
+}
+.bar-row { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+.bar-label { width: 52px; font-size: 11.5px; color: var(--muted); text-align: right; flex-shrink: 0; }
+.bar-track { flex: 1; height: 8px; background: rgba(255,255,255,.06); border-radius: 4px; overflow: hidden; }
+.bar-fill { height: 100%; background: linear-gradient(90deg, #3d8bfd, #7cc4ff); border-radius: 4px; }
+.bar-pct { width: 34px; font-size: 11.5px; font-weight: 700; flex-shrink: 0; }

@@ -63,6 +63,45 @@ function App() {
   const [mapOpen, setMapOpen] = useState(false);
   const [fetchingLoc, setFetchingLoc] = useState(false);
 
+  // ---- derived slope analysis (from the same true-scale normals the 3D view uses)
+  const slopeBuckets = (() => {
+    if (!data) return null;
+    try {
+      const pos = data.stats.positions;
+      const tris = data.stats.triangles;
+      const acc = new Float64Array(pos.length);
+      const cnt = new Float64Array(pos.length);
+      for (const [a, b, c] of tris) {
+        const ax = pos[a][0], ay = pos[a][1], az = pos[a][2];
+        const ux = pos[b][0] - ax, uy = pos[b][1] - ay, uz = pos[b][2] - az;
+        const vx = pos[c][0] - ax, vy = pos[c][1] - ay, vz = pos[c][2] - az;
+        const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        const len = Math.hypot(nx, ny, nz);
+        if (len === 0) continue;
+        const slopeDeg = (Math.acos(Math.min(1, Math.abs(nz) / len)) * 180) / Math.PI;
+        acc[a] += slopeDeg; cnt[a] += 1;
+        acc[b] += slopeDeg; cnt[b] += 1;
+        acc[c] += slopeDeg; cnt[c] += 1;
+      }
+      const edges = [5, 10, 15, 25, 35]; // ° class boundaries
+      const counts = new Array(edges.length + 1).fill(0);
+      for (const [a, b, c] of tris) {
+        // triangle area in plan (shoelace) used as the weight for its mean slope
+        const ax = pos[a][0], ay = pos[a][1];
+        const bx = pos[b][0], by = pos[b][1];
+        const cx = pos[c][0], cy = pos[c][1];
+        const ar = Math.abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax)) / 2;
+        if (ar === 0 || cnt[a] === 0 || cnt[b] === 0 || cnt[c] === 0) continue;
+        const s = (acc[a] / cnt[a] + acc[b] / cnt[b] + acc[c] / cnt[c]) / 3;
+        let k = 0; while (k < edges.length && s >= edges[k]) k++;
+        counts[k] += ar;
+      }
+      const sum = counts.reduce((a: number, b: number) => a + b, 0) || 1;
+      const labels = ["0–5°", "5–10°", "10–15°", "15–25°", "25–35°", ">35°"];
+      return labels.map((label, i) => ({ label, pct: (counts[i] / sum) * 100 }));
+    } catch { return null; }
+  })();
+
   /** Shared loader: both DXF upload and satellite fetch return the same payload shape. */
   const loadPayload = async (r: Response) => {
     if (!r.ok) {
@@ -181,10 +220,11 @@ function App() {
               <span className={`step-num ${building ? "done" : ""}`}>{building ? "✓" : "2"}</span>
               <label className="btn">
                 {buildingBusy ? <><span className="spinner" /> Converting IFC…</>
-                  : building ? `Replace model (${building.name})` : "Upload building (IFC)"}
+                  : building ? `Replace model (${building.name})` : "Upload building model (IFC)"}
                 <input type="file" accept=".ifc,.xifc" hidden disabled={buildingBusy}
                        onChange={(e) => e.target.files?.[0] && onBuilding(e.target.files[0])} />
               </label>
+              <p className="hint small">Place your design on the land to pitch it in true scale.</p>
             </div>
 
             {building && (
@@ -212,7 +252,40 @@ function App() {
               <button className="btn small" onClick={() => setCameraView({ kind: "fit" })}>Fit site</button>
             </div>
 
-            <Section title="Display" defaultOpen>
+            {/* SITE ANALYSIS — appears only after the 3D model is shown */}
+            <Section title="Site analysis" defaultOpen>
+              <table className="kv">
+                <tbody>
+                  {data.area_m2 != null && (
+                    <tr><td>Plot area</td><td>{data.area_m2.toFixed(1)} m²</td></tr>)}
+                  {data.perimeter_m != null && (
+                    <tr><td>Perimeter</td><td>{data.perimeter_m.toFixed(1)} m</td></tr>)}
+                  <tr><td>Elevation range</td>
+                      <td>{st!.min_elev.toFixed(2)} – {st!.max_elev.toFixed(2)} m</td></tr>
+                  <tr><td>Relief</td><td>{(st!.max_elev - st!.min_elev).toFixed(2)} m</td></tr>
+                  <tr><td>Average slope</td>
+                      <td>{((st as any).slope_mean_deg ?? 0).toFixed(1)}°</td></tr>
+                  {data.contour_interval && (
+                    <tr><td>Contour interval</td><td>{data.contour_interval} m</td></tr>)}
+                </tbody>
+              </table>
+              {slopeBuckets && (
+                <div className="slope-chart">
+                  <p className="chart-title">Slope distribution (by area)</p>
+                  {slopeBuckets.map((b) => (
+                    <div key={b.label} className="bar-row">
+                      <span className="bar-label">{b.label}</span>
+                      <div className="bar-track">
+                        <div className="bar-fill" style={{ width: `${Math.min(100, b.pct)}%` }} />
+                      </div>
+                      <span className="bar-pct">{b.pct.toFixed(0)}%</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Section>
+
+            <Section title="Display & visualization">
               <Toggle label="Elevation coloring" checked={!slopeColor} onChange={(v) => setSlopeColor(!v)} />
               <Toggle label="Slope coloring" checked={slopeColor} onChange={setSlopeColor} />
               <Toggle label="Contour lines" checked={showContours} onChange={setShowContours} />
@@ -240,7 +313,7 @@ function App() {
               <p className="hint">Click two points on the ground to read distance and level difference.</p>
             </Section>
 
-            <Section title="Site data">
+            <Section title="Site data (detailed)">
               <table className="kv">
                 <tbody>
                   <tr><td>Min elevation</td><td>{st!.min_elev.toFixed(3)} m</td></tr>
@@ -310,18 +383,33 @@ function App() {
         ) : (
           <div className="empty">
             <h2>See your land in true-scale 3D</h2>
-            <p>Upload a DXF land survey to build an accurate terrain model — or pick a
-               plot on the satellite map to fetch real elevation instantly.<br />
-               Then optionally drop your building (IFC) onto it.</p>
-            <label className={`dropzone ${dragOver ? "drag" : ""}`}>
-              <span className="big">{uploading ? "Processing survey…" : "Drop DXF here or click to browse"}</span>
-              <small>Land survey with spot levels (POINT / CONTPOINT entities)</small>
-              <input type="file" accept=".dxf" hidden disabled={uploading}
-                     onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
-            </label>
-            <button className="btn" onClick={() => setMapOpen(true)}>
-              Or pick location on satellite map
-            </button>
+            <p>Start with one of the two options below. The 3D model appears instantly,
+               then slope analysis and visualization tools unlock — and you can drop
+               your building design (IFC) right onto the terrain.</p>
+
+            <div className="choice-grid">
+              <label className={`choice-card ${dragOver ? "drag" : ""}`}>
+                <span className="choice-icon">📐</span>
+                <span className="choice-title">Upload DXF survey</span>
+                <span className="choice-desc">
+                  Land survey with spot levels (POINT / CONTPOINT entities).
+                  Drop the file here or click to browse.
+                </span>
+                {uploading && <span className="choice-desc">Processing…</span>}
+                <input type="file" accept=".dxf" hidden disabled={uploading}
+                       onChange={(e) => e.target.files?.[0] && onFile(e.target.files[0])} />
+              </label>
+
+              <button className="choice-card" onClick={() => setMapOpen(true)}>
+                <span className="choice-icon">🗺️</span>
+                <span className="choice-title">Select land on map</span>
+                <span className="choice-desc">
+                  Pick any plot on the satellite map — we fetch real elevation
+                  (Copernicus GLO‑30) for that area automatically.
+                </span>
+                {fetchingLoc && <span className="choice-desc">Fetching elevation…</span>}
+              </button>
+            </div>
           </div>
         )}
       </main>
