@@ -3,18 +3,19 @@ import L from "leaflet";
 import { useEffect, useRef, useState } from "react";
 
 /**
- * MapPicker — satellite map for choosing a site by DRAWING its boundary.
+ * MapPicker — satellite map for choosing a site by CLICKING boundary points.
  *
- * Workflow (freehand polygon, like tracing a plot on paper):
- *   1. Press & hold the left mouse button anywhere on the map.
- *   2. Drag to trace the plot outline — vertices are captured automatically.
- *   3. Release the button to close the polygon. Live area readout in m².
- *   4. "Redraw" clears it; "Build terrain here" sends the polygon to the
- *      backend, which samples real Copernicus GLO-30 elevations INSIDE the
- *      drawn outline only.
+ * Workflow (vertex-by-corner polygon):
+ *   1. Zoom to your plot and left-click once per corner of the boundary.
+ *      Each click drops a numbered marker; consecutive corners are joined
+ *      with a live outline and area readout in m².
+ *   2. Mis-clicked? Click the small "×" on any vertex marker to delete it.
+ *   3. When every corner is placed, press "Build terrain here". The polygon
+ *      is sent to the backend, which samples real Copernicus GLO-30
+ *      elevations INSIDE the drawn outline only.
  *
  * Leaflet is used imperatively so the map survives React re-renders inside
- * the modal. No rectangle/circle tools — pure freehand tracing.
+ * the modal. No rectangle/circle tools — pure point-connected polygons.
  */
 export type Ring = [number, number][]; // [lat, lon]
 
@@ -23,34 +24,69 @@ export default function MapPicker({ onPick, busy }:
     busy: boolean }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
-  const drawingRef = useRef(false);
   const ringRef = useRef<Ring>([]);
   const polyRef = useRef<L.Polygon | null>(null);
-  const pathRef = useRef<L.Polyline | null>(null);
+  const lineRef = useRef<L.Polyline | null>(null);
+  const markersRef = useRef<L.Marker[]>([]);
   const [ring, setRing] = useState<Ring>([]);
   const [areaM2, setAreaM2] = useState(0);
 
-  function metersPerPixel(map: L.Map): number {
-    const b = map.getBounds();
-    const px = map.getPixelBounds();
-    const widthPx = Math.max(1, (px?.max?.x ?? 0) - (px?.min?.x ?? 0));
-    const degPerPx = (b.getEast() - b.getWest()) / widthPx;
-    return degPerPx * 111_320 * Math.cos((map.getCenter().lat * Math.PI) / 180);
+  function renderVertex(i: number) {
+    const map = mapRef.current;
+    if (!map) return;
+    const [lat, lon] = ringRef.current[i];
+    const icon = L.divIcon({
+      className: "vertex-icon",
+      html: `<div class="vertex-dot">${i + 1}<button class="vertex-del" title="Remove this point">×</button></div>`,
+      iconSize: [26, 26],
+      iconAnchor: [13, 13],
+    });
+    const m = L.marker([lat, lon], { icon, draggable: true, zIndexOffset: 1000 }).addTo(map);
+    m.on("drag", () => {
+      const p = m.getLatLng();
+      ringRef.current[i] = [p.lat, p.lng];
+      updateShape();
+    });
+    m.on("dragend", () => {
+      const p = m.getLatLng();
+      ringRef.current[i] = [p.lat, p.lng];
+      setRing([...ringRef.current]);
+      updateShape();
+    });
+    // Delete via the × button inside the divIcon.
+    const el = m.getElement();
+    el?.querySelector(".vertex-del")?.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      removeVertex(i);
+    });
+    markersRef.current[i] = m;
+  }
+
+  function removeVertex(i: number) {
+    ringRef.current.splice(i, 1);
+    markersRef.current.forEach((m) => m?.remove());
+    markersRef.current = [];
+    ringRef.current.forEach((_, j) => renderVertex(j));
+    setRing([...ringRef.current]);
+    updateShape();
   }
 
   function updateShape() {
     const map = mapRef.current;
     if (!map) return;
     const pts = ringRef.current;
-    if (!pathRef.current) {
-      pathRef.current = L.polyline(pts, { color: "#ffd166", weight: 2.5, dashArray: "4 4" }).addTo(map);
-    } else pathRef.current.setLatLngs(pts);
+    if (!lineRef.current) {
+      lineRef.current = L.polyline(pts, { color: "#ffd166", weight: 2.5, dashArray: "4 4" }).addTo(map);
+    } else lineRef.current.setLatLngs(pts);
     if (pts.length >= 3) {
       if (!polyRef.current) {
         polyRef.current = L.polygon(pts, {
-          color: "#8ab4ff", weight: 2, fillColor: "#8ab4ff", fillOpacity: 0.15,
+          color: "#8ab4ff", weight: 2, fillColor: "#8ab4ff", fillOpacity: 0.15, interactive: false,
         }).addTo(map);
       } else polyRef.current.setLatLngs(pts);
+    } else {
+      polyRef.current?.remove();
+      polyRef.current = null;
     }
     setAreaM2(polyAreaM2(pts));
   }
@@ -65,36 +101,16 @@ export default function MapPicker({ onPick, busy }:
     ).addTo(map);
     L.control.scale({ imperial: false }).addTo(map);
 
-    const capture = (e: L.LeafletMouseEvent) => {
-      const last = ringRef.current[ringRef.current.length - 1];
-      if (last && map.distance(last, e.latlng) < 8 * metersPerPixel(map)) return;
+    // Left-click adds a boundary vertex. Double-click / right-click stay
+    // available for map navigation (we disable leaflet's dblclick zoom so
+    // rapid corner clicks don't fight each other).
+    map.doubleClickZoom.disable();
+    map.on("click", (e: L.LeafletMouseEvent) => {
       ringRef.current = [...ringRef.current, [e.latlng.lat, e.latlng.lng]];
-      setRing(ringRef.current);
+      renderVertex(ringRef.current.length - 1);
+      setRing([...ringRef.current]);
       updateShape();
-    };
-
-    map.on("mousedown", (e: L.LeafletMouseEvent) => {
-      if (e.originalEvent.button !== 0) return;
-      drawingRef.current = true;
-      ringRef.current = [[e.latlng.lat, e.latlng.lng]];
-      setRing(ringRef.current);
-      updateShape();
-      map.dragging.disable(); // we own the mouse while drawing
     });
-    map.on("mousemove", (e: L.LeafletMouseEvent) => {
-      if (drawingRef.current) capture(e);
-    });
-    const stop = () => {
-      if (!drawingRef.current) return;
-      drawingRef.current = false;
-      map.dragging.enable();
-      if (ringRef.current.length >= 3) {
-        map.fitBounds(L.polygon(ringRef.current).getBounds().pad(0.2));
-      }
-      updateShape();
-    };
-    map.on("mouseup", stop);
-    map.on("mouseout", stop);
 
     mapRef.current = map;
     return () => { map.remove(); mapRef.current = null; };
@@ -105,8 +121,10 @@ export default function MapPicker({ onPick, busy }:
     ringRef.current = [];
     setRing([]);
     setAreaM2(0);
+    markersRef.current.forEach((m) => m?.remove());
+    markersRef.current = [];
     polyRef.current?.remove(); polyRef.current = null;
-    pathRef.current?.remove(); pathRef.current = null;
+    lineRef.current?.remove(); lineRef.current = null;
   }
 
   const centroid = (): [number, number] => {
@@ -121,22 +139,23 @@ export default function MapPicker({ onPick, busy }:
     <div className="modal-backdrop">
       <div className="modal map-modal">
         <div className="modal-head">
-          <h3>Trace your plot on the satellite map</h3>
+          <h3>Mark your plot boundary with points</h3>
           <button className="btn ghost small" onClick={redraw}>↺ Redraw</button>
         </div>
         <p className="hint">
-          <b>Press and hold</b> the left mouse button, <b>drag to trace</b> the plot
-          boundary, then <b>release</b> to finish. Zoom in first for accurate tracing.
-          Elevation comes from the public Copernicus GLO‑30 model (~30 m grid) — great
-          for visual studies, not survey-grade.
+          Zoom in to your land, then <b>left-click once at each corner</b> of the
+          plot boundary. Points connect automatically into an outline. You can
+          <b> drag a point</b> to adjust it or click its <b>×</b> to delete it.
+          Elevation comes from the public Copernicus GLO‑30 model (~30 m grid) —
+          great for visual studies, not survey-grade.
         </p>
         <div ref={hostRef} className="map-host" />
         <div className="map-controls">
           <div className="draw-readout">
             <span><b>{ring.length}</b> points</span>
             <span><b>{areaM2.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b> m²</span>
-            {!valid && ring.length > 0 && <em>Draw a larger closed shape (≥ 3 corners, ≥ 200 m²)</em>}
-            {ring.length === 0 && <em>Awaiting your first click-and-drag…</em>}
+            {!valid && ring.length > 0 && <em>Add at least 3 corners enclosing ≥ 200 m²</em>}
+            {ring.length === 0 && <em>Click the first corner of the plot…</em>}
           </div>
           <button
             className="btn primary"
@@ -147,7 +166,7 @@ export default function MapPicker({ onPick, busy }:
               const half = Math.min(1000, Math.max(30, Math.sqrt(areaM2 / Math.PI)));
               onPick(lat, lon, half, ring);
             }}>
-            {busy ? "Fetching elevation…" : valid ? "Build terrain here" : "Trace the boundary first"}
+            {busy ? "Fetching elevation…" : valid ? "Build terrain here" : "Place boundary points"}
           </button>
         </div>
       </div>

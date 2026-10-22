@@ -192,7 +192,26 @@ table.kv tr:last-child td { border-bottom: 0; }
 .modal-head h3 { margin: 0; font-size: 1.05rem; }
 .icon-btn { background: none; border: none; color: inherit; font-size: 1.1rem; cursor: pointer; opacity: .7; }
 .icon-btn:hover { opacity: 1; }
-.map-host { height: 420px; border-radius: 10px; overflow: hidden; margin: 12px 0; border: 1px solid var(--border, #26303c); }
+.map-host { height: 420px; border-radius: 10px; overflow: hidden; margin: 12px 0; border: 1px solid var(--border, #26303c); cursor: crosshair; }
+
+/* Boundary vertex markers drawn on the map */
+.vertex-icon { background: transparent; border: none; }
+.vertex-dot {
+  position: relative;
+  width: 26px; height: 26px; border-radius: 50%;
+  background: #ffd166; color: #1a1f26;
+  font-weight: 700; font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 0 0 2px rgba(0,0,0,.45);
+}
+.vertex-del {
+  position: absolute; top: -9px; right: -9px;
+  width: 16px; height: 16px; line-height: 14px;
+  border-radius: 50%; border: none; cursor: pointer;
+  background: #e5484d; color: #fff; font-size: 11px; padding: 0;
+  display: none; align-items: center; justify-content: center;
+}
+.vertex-dot:hover .vertex-del { display: flex; }
 .map-controls { display: flex; align-items: center; gap: 16px; justify-content: space-between; flex-wrap: wrap; }
 .slider.compact { flex: 1; min-width: 200px; }
 .hint.small { font-size: .78rem; opacity: .7; margin-top: 8px; }
