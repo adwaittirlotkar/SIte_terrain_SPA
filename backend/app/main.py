@@ -1,330 +1,257 @@
+"""FastAPI backend -- accurate 3D terrain viewer pipeline.
+
+Accuracy contract:
+- Elevations are float64 end-to-end (DXF -> API -> Three.js Float64Array).
+- No vertical exaggeration by default (frontend defaults to 1.0).
+- Slope coloring uses true surface normals, not the exaggerated mesh.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
 import tempfile
 import uuid
-import os
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import numpy as np
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
-from . import dxf_parser, terrain, geometry, storage, elevation_source, osm_source, groundwater_source
-from .schemas import UploadResponse, SiteResponse, TerrainResponse, BoundaryInfo, ElevationStats, PlaceResponse
+from .dxf_parser import parse_dxf
+from .tin import build_tin, compute_stats, dynamic_contour_interval
+from .contours import extract_contours
+from .ground import sample_ground
 
-app = FastAPI(title="SPA Site Intelligence API", version="0.1.0")
+DATA_DIR = os.environ.get("SITE_DATA_DIR", os.path.join(os.getcwd(), "data", "projects"))
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB hard limit
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten before this leaves your laptop
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="SPA Site Intelligence (accuracy build)")
 
-
-class LocationRequest(BaseModel):
-    south: float
-    north: float
-    west: float
-    east: float
-    dem_source: str = "surface"  # "surface" (Copernicus) or "bare_earth" (FABDEM)
+ALLOWED_ORIGINS = [o for o in os.environ.get(
+    "SITE_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if o]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS,
+                   allow_methods=["*"], allow_headers=["*"])
 
 
-def _finalize_terrain(
-    project_id: str,
-    filename: str,
-    points: list,
-    boundary_info: BoundaryInfo,
-    warnings: list,
-    layer_summary: dict,
-    elevation_reference: str,
-) -> UploadResponse:
-    """Shared by both input paths (DXF upload and map location fetch):
-    build the TIN, compute stats, persist, and shape the response."""
-    try:
-        vertices, faces = terrain.build_tin(points)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    elevation = terrain.elevation_stats(points)
-    avg_slope = terrain.average_slope_percent(vertices, faces)
-    slope_analysis = terrain.slope_area_breakdown(vertices, faces)
-    contours = terrain.contour_lines(vertices, faces, interval=max(elevation["range"] / 10, 0.1))
-
-    storage.save_json(project_id, "terrain", {
-        "vertices": vertices,
-        "faces": faces,
-        "elevation_min": elevation["min"],
-        "elevation_max": elevation["max"],
-        "contours": contours,
-    })
-    site_data = {
-        "project_id": project_id,
-        "filename": filename,
-        "point_count": len(points),
-        "face_count": len(faces),
-        "boundary": boundary_info.model_dump(),
-        "elevation": elevation,
-        "elevation_reference": elevation_reference,
-        "average_slope_percent": avg_slope,
-        "slope_analysis": slope_analysis,
-        "layer_summary": layer_summary,
-        "warnings": warnings,
-    }
-    storage.save_json(project_id, "site", site_data)
-    return UploadResponse(**site_data)
+def _project_dir(pid: str) -> str:
+    d = os.path.join(DATA_DIR, pid)
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"ok": True}
 
 
-@app.post("/api/upload", response_model=UploadResponse)
-async def upload_survey(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".dxf"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only .dxf files are supported in v1. Convert DWG to DXF first "
-                   "(see README for options).",
-        )
+MAX_IFC_BYTES = 100 * 1024 * 1024  # 100 MB BIM models
 
-    content = await file.read()
-    project_id = str(uuid.uuid4())
-    warnings = []
 
-    # Write to a temp path for ezdxf to read, then archive the original.
-    with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
+@app.post("/api/building/{pid}")
+async def upload_building(pid: str, file: UploadFile = File(...)):
+    """Tessellate an IFC building model to a flat mesh for terrain preview.
 
+    Returns vertices/triangles in model-local metres (Z-up) plus its bbox so
+    the viewer can anchor the base onto the sampled ground elevation.
+    """
+    if not file.filename or not file.filename.lower().endswith((".ifc", ".xifc")):
+        raise HTTPException(400, "Only .ifc BIM models are supported.")
+    raw = await file.read()
+    if len(raw) > MAX_IFC_BYTES:
+        raise HTTPException(413, f"IFC exceeds {MAX_IFC_BYTES // (1024*1024)} MB limit.")
+    if not os.path.isdir(os.path.join(DATA_DIR, pid)):
+        raise HTTPException(404, f"Unknown site {pid}. Upload a survey first.")
     try:
-        try:
-            points = dxf_parser.extract_survey_points(tmp_path)
-            layer_summary = dxf_parser.layer_summary(tmp_path)
-            boundary_candidates = dxf_parser.find_boundary_candidates(tmp_path)
-        except dxf_parser.DxfParseError as e:
-            raise HTTPException(status_code=422, detail=str(e))
+        from .building import extract_ifc_mesh
+        mesh = extract_ifc_mesh(raw)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except ImportError:
+        raise HTTPException(501, "IFC support not installed (pip install ifcopenshell).")
+    except Exception as e:
+        raise HTTPException(400, f"Failed to read IFC: {e}")
+    mesh["name"] = file.filename
+    # Ground-conformance data: base elevation at model centre + per-corner
+    # samples so the viewer can drop/tilt the building onto the real TIN.
+    try:
+        with open(os.path.join(DATA_DIR, pid, "tin.json")) as f:
+            tin = json.load(f)
+        cx = 0.5 * (mesh["bbox"]["min"][0] + mesh["bbox"]["max"][0])
+        cy = 0.5 * (mesh["bbox"]["min"][1] + mesh["bbox"]["max"][1])
+        lo, hi = mesh["bbox"]["min"], mesh["bbox"]["max"]
+        corners = [[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]]]
+        mesh["ground"] = sample_ground(
+            np.asarray(tin["points_xy"]), np.asarray(tin["z"]),
+            np.asarray(tin["simplices"]), corners + [[cx, cy]])
+    except Exception:
+        pass
+    with open(os.path.join(_project_dir(pid), "building.json"), "w") as f:
+        json.dump(mesh, f)
+    return mesh
 
-        if len(points) < 3:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Only found {len(points)} usable coordinate points in this file. "
-                       f"Need at least 3 to build a terrain model.",
-            )
 
-        boundary_info = BoundaryInfo()
-        if len(boundary_candidates) == 1:
-            b = boundary_candidates[0]
-            analysis = geometry.analyze_boundary(b["points"])
-            boundary_info = BoundaryInfo(
-                area_m2=analysis["area_m2"],
-                perimeter_m=analysis["perimeter_m"],
-                centroid=analysis["centroid"],
-                layer=b["layer"],
-                status="FOUND",
-                corners=[list(p) for p in b["points"]],
-            )
-        elif len(boundary_candidates) > 1:
-            # Pick the largest by vertex count as a best guess, but say so honestly.
-            best = max(boundary_candidates, key=lambda c: c["vertex_count"])
-            analysis = geometry.analyze_boundary(best["points"])
-            boundary_info = BoundaryInfo(
-                area_m2=analysis["area_m2"],
-                perimeter_m=analysis["perimeter_m"],
-                centroid=analysis["centroid"],
-                layer=best["layer"],
-                status="AMBIGUOUS",
-                corners=[list(p) for p in best["points"]],
-            )
-            warnings.append(
-                f"Found {len(boundary_candidates)} closed polylines that could be the site "
-                f"boundary. Used the layer '{best['layer']}' (most vertices) as a best guess - "
-                f"verify this against the source drawing."
-            )
-        else:
-            warnings.append(
-                "No closed polyline found to use as a site boundary. Area/perimeter are unavailable; "
-                "the terrain model itself is still built from the raw survey points."
-            )
+@app.post("/api/cut-fill/{pid}")
+async def cut_fill_endpoint(pid: str, body: dict):
+    """Cut/fill volumes between a flat platform level and the site TIN."""
+    from .ground import cut_fill as _cf
+    d = os.path.join(DATA_DIR, pid)
+    if not os.path.isdir(d):
+        raise HTTPException(404, f"Unknown site {pid}.")
+    ring = body.get("ring")
+    level = float(body.get("level", 0.0))
+    cell = float(body.get("cell_m", 1.0))
+    if not ring or len(ring) < 3:
+        raise HTTPException(422, "Provide a closed footprint ring of >=3 [x,y] points.")
+    cell = min(max(cell, 0.25), 10.0)
+    with open(os.path.join(d, "tin.json")) as f:
+        tin = json.load(f)
+    return _cf(np.asarray(tin["points_xy"]), np.asarray(tin["z"]),
+               np.asarray(tin["simplices"]), ring, level, cell)
 
-        # Archive the original upload for traceability.
-        storage.save_original_file(project_id, file.filename, content)
 
-        return _finalize_terrain(
-            project_id, file.filename, points, boundary_info, warnings, layer_summary,
-            elevation_reference=(
-                "Survey's own reference datum, as recorded by the surveyor - not confirmed as "
-                "mean sea level unless stated on the source drawing itself."
-            ),
-        )
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".dxf"):
+        raise HTTPException(400, "Only .dxf land surveys are supported.")
+    raw = await file.read()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File exceeds {MAX_UPLOAD_BYTES // (1024*1024)} MB limit.")
 
+    with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+    try:
+        parsed = parse_dxf(tmp_path)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(400, f"Failed to read DXF: {e}")
     finally:
         os.unlink(tmp_path)
 
+    tin = build_tin(parsed.points)
+    stats = compute_stats(tin)
+    pid = uuid.uuid4().hex[:12]
+    # Persist the TIN so BIM placement (/api/building/{pid}) and cut/fill can
+    # sample real ground elevations without re-parsing the DXF.
+    with open(os.path.join(_project_dir(pid), "tin.json"), "w") as f:
+        json.dump({
+            "points_xy": np.asarray(tin["points_xy"]).tolist(),
+            "z": np.asarray(tin["z"]).tolist(),
+            "simplices": np.asarray(tin["simplices"]).tolist(),
+        }, f)
+    interval = dynamic_contour_interval(stats)
+    levels = [math.ceil(stats["min_elev"] / interval) * interval + i * interval
+              for i in range(int(math.floor(stats["relief"] / interval)) + 1)]
+    contours = extract_contours(tin["points_xy"], tin["z"], tin["simplices"], levels)
 
-@app.post("/api/fetch-location", response_model=UploadResponse)
-def fetch_location(req: LocationRequest):
-    """
-    Real-world terrain for a map-picked area, via the free/keyless
-    Copernicus GLO-30 DEM on AWS Open Data. See elevation_source.py for
-    the data-source details and known accuracy caveats.
-    """
-    try:
-        if req.dem_source == "bare_earth":
-            grid = elevation_source.fetch_elevation_grid_bare_earth(req.south, req.north, req.west, req.east)
-        else:
-            grid = elevation_source.fetch_elevation_grid(req.south, req.north, req.west, req.east)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except elevation_source.ElevationFetchError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    boundary = _boundary_from_tin(tin)
+    area, perimeter = _area_perimeter(boundary)
 
-    points, origin = elevation_source.to_local_points(grid["lats"], grid["lons"], grid["elevations"])
-
-    # Boundary = the selected bbox itself, converted into the same local
-    # coordinate system as the elevation points.
-    corner_lats = [req.south, req.south, req.north, req.north, req.south]
-    corner_lons = [req.west, req.east, req.east, req.west, req.west]
-    corner_points, _ = elevation_source.to_local_points(
-        corner_lats, corner_lons, [0] * 5, origin=origin
-    )
-    boundary_xy = [(p["x"], p["y"]) for p in corner_points]
-    boundary_analysis = geometry.analyze_boundary(boundary_xy)
-    boundary_info = BoundaryInfo(
-        area_m2=boundary_analysis["area_m2"],
-        perimeter_m=boundary_analysis["perimeter_m"],
-        centroid=boundary_analysis["centroid"],
-        layer="SELECTED_AREA",
-        status="FOUND",
-        corners=[list(p) for p in boundary_xy],
-    )
-
-    resolution_used = grid["resolution_m"]
-    is_bare_earth = req.dem_source == "bare_earth"
-    source_label = "FABDEM (bare-earth)" if is_bare_earth else f"Copernicus GLO-{resolution_used}"
-    warnings = list(grid["warnings"])
-    if is_bare_earth:
-        warnings.append(
-            f"Elevation sourced from FABDEM (~{resolution_used}m resolution) - the same "
-            f"underlying Copernicus data as 'Surface' mode, but ML-corrected to remove tree "
-            f"canopy and rooftop height, giving true bare-earth ground level. Still not "
-            f"survey-grade, and distributed via a smaller community-maintained source than "
-            f"Copernicus's official hosting."
-        )
-    else:
-        warnings.append(
-            f"Elevation sourced from Copernicus GLO-{resolution_used} (~{resolution_used}m resolution, "
-            f"satellite-derived surface model). It measures the top of tree canopy / rooftops in "
-            f"vegetated or built-up areas, not bare ground - and is not survey-grade. Good for "
-            f"context and massing, not for engineering decisions."
-        )
-
-    project_id = str(uuid.uuid4())
-    filename = f"location_{req.south:.4f}N_{req.west:.4f}E"
-    layer_summary = {f"{'FABDEM' if is_bare_earth else f'COPERNICUS_GLO{resolution_used}'}": len(points)}
-
-    storage.save_json(project_id, "location", {
-        "south": req.south, "north": req.north, "west": req.west, "east": req.east,
-        "origin_lat": origin[0], "origin_lon": origin[1],
-    })
-
-    return _finalize_terrain(
-        project_id, filename, points, boundary_info, warnings, layer_summary,
-        elevation_reference=(
-            "Meters above mean sea level (EGM2008 geoid) - bare-earth (FABDEM), forest/building "
-            "height removed." if is_bare_earth else
-            "Meters above mean sea level (EGM2008 geoid) - Copernicus DEM's native vertical reference."
-        ),
-    )
-
-
-@app.get("/api/site/{project_id}", response_model=SiteResponse)
-def get_site(project_id: str):
-    data = storage.load_json(project_id, "site")
-    if data is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return SiteResponse(**data)
-
-
-@app.get("/api/terrain/{project_id}", response_model=TerrainResponse)
-def get_terrain(project_id: str):
-    data = storage.load_json(project_id, "terrain")
-    if data is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return TerrainResponse(**data)
-
-
-@app.get("/api/place/{project_id}", response_model=PlaceResponse)
-def get_place(project_id: str):
-    """
-    Real buildings and roads for this project's area, from OpenStreetMap -
-    the "Place" mode alongside plain "Terrain". Only available for
-    location-fetched terrain (a DXF survey has no real-world lat/lon to
-    query OSM against). Building heights are drawn from OSM tags where
-    present and clearly marked ESTIMATED where they're not (see
-    osm_source.py) - never silently invented.
-    """
-    location = storage.load_json(project_id, "location")
-    if location is None:
-        raise HTTPException(
-            status_code=404,
-            detail="No place data available for this project. Place mode only works for "
-                   "terrain fetched via 'Pick a Real Location', not DXF uploads.",
-        )
-    terrain_data = storage.load_json(project_id, "terrain")
-    if terrain_data is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    try:
-        place_data = osm_source.fetch_place_data(
-            location["south"], location["north"], location["west"], location["east"],
-            origin=(location["origin_lat"], location["origin_lon"]),
-            terrain_vertices=terrain_data["vertices"],
-        )
-    except osm_source.OsmFetchError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    return PlaceResponse(**place_data)
-
-
-@app.get("/api/terrain/{project_id}/groundwater")
-def get_groundwater(project_id: str):
-    """
-    Real, measured groundwater depth from the nearest known CGWB monitoring
-    well, via India's National Water Data Portal - NOT computed from
-    elevation, never estimated for a location that isn't a real station.
-    Only available for location-fetched terrain, and only in regions with
-    confirmed data coverage (currently Maharashtra only - see
-    groundwater_source.py). A location outside coverage returns
-    available=False, not an error - that's the normal, expected case almost
-    everywhere until more states are added.
-    """
-    location = storage.load_json(project_id, "location")
-    if location is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Groundwater lookup only works for terrain fetched via 'Pick a Real Location', "
-                   "not DXF uploads.",
-        )
-
-    origin = (location["origin_lat"], location["origin_lon"])
-    try:
-        data = groundwater_source.get_nearest_groundwater_data(origin[0], origin[1])
-    except groundwater_source.GroundwaterError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    if data is None:
-        return {
-            "available": False,
-            "message": "No groundwater monitoring data source is wired up for this region yet "
-                       "(currently only Maharashtra is supported).",
-        }
-
-    station_point, _ = elevation_source.to_local_points(
-        [data["station_lat"]], [data["station_lon"]], [0], origin=origin
-    )
-    return {
-        "available": True,
-        **data,
-        "station_local_x": station_point[0]["x"],
-        "station_local_y": station_point[0]["y"],
+    payload = {
+        "id": pid,
+        "name": file.filename,
+        "units_hint": parsed.units_hint,
+        "warnings": parsed.warnings,
+        "layers": parsed.layers,
+        "skipped_layers": parsed.skipped_layers,
+        "stats": stats,
+        "contour_interval": interval,
+        "contours": contours,
+        "boundary": boundary,
+        "area_m2": area,
+        "perimeter_m": perimeter,
     }
+    with open(os.path.join(_project_dir(pid), "site.json"), "w") as f:
+        json.dump(payload, f)
+    return payload
 
+
+def _boundary_from_tin(tin) -> list[list[float]]:
+    """Edge-aware site boundary.
+
+    Uses the actual TIN edges (faces surviving slope pruning): a boundary
+    edge belongs to exactly one triangle, so walking the connected chain of
+    such edges traces the REAL site outline -- including concavities and
+    gaps -- instead of a convex hull that fabricates ground over areas with
+    no survey points. Falls back to the convex hull only if the walk fails.
+    """
+    xy = tin["points_xy"]
+    simplices = tin["simplices"]
+    if len(xy) < 3 or len(simplices) == 0:
+        return _convex_boundary(xy)
+    try:
+        # Vectorised: an edge shared by two faces appears twice in the stacked
+        # sorted-edge array; boundary edges appear exactly once.
+        import numpy as np
+        e = np.concatenate([
+            np.sort(simplices[:, [0, 1]], axis=1),
+            np.sort(simplices[:, [1, 2]], axis=1),
+            np.sort(simplices[:, [2, 0]], axis=1),
+        ], axis=0)
+        uniq, counts = np.unique(e, axis=0, return_counts=True)
+        bnd_edges = uniq[counts == 1]
+        if len(bnd_edges) < 3:
+            return _convex_boundary(xy)
+        from collections import defaultdict
+        adj = defaultdict(list)
+        for a, b in bnd_edges.tolist():
+            adj[a].append(b)
+            adj[b].append(a)
+        loops: list[list[int]] = []
+        seen_edges: set[tuple[int, int]] = set()
+        for v0 in list(adj):
+            for w in adj[v0]:
+                if (min(v0, w), max(v0, w)) in seen_edges:
+                    continue
+                # Greedy loop walk through degree-2 chains.
+                loop = [v0]
+                prev, cur = v0, w
+                guard = 0
+                while cur != v0 and guard <= len(adj):
+                    guard += 1
+                    loop.append(cur)
+                    seen_edges.add((min(prev, cur), max(prev, cur)))
+                    nxts = [n for n in adj[cur] if n != prev]
+                    if not nxts:
+                        break
+                    prev, cur = cur, nxts[0]
+                seen_edges.add((min(prev, cur), max(prev, cur)))
+                if cur == v0 and len(loop) >= 3:
+                    loops.append(loop)
+        if not loops:
+            return _convex_boundary(xy)
+        # Keep every closed loop (outer + inner rings); area/perimeter uses
+        # the largest signed-area ring(s) via shapely downstream.
+        def shoelace2(loop):
+            pts_ = xy[loop]
+            x_ = pts_[:, 0]; y_ = pts_[:, 1]
+            return abs(float(np.dot(x_, np.roll(y_, -1)) - np.dot(y_, np.roll(x_, -1))))
+        best = max(loops, key=shoelace2)
+        return [[float(xy[i][0]), float(xy[i][1])] for i in best]
+    except Exception:
+        return _convex_boundary(xy)
+
+
+def _convex_boundary(xy) -> list[list[float]]:
+    from scipy.spatial import ConvexHull
+    if len(xy) < 3:
+        return []
+    try:
+        h = ConvexHull(xy)
+        return [[float(xy[i][0]), float(xy[i][1])] for i in h.vertices]
+    except Exception:
+        return []
+
+
+def _area_perimeter(poly):
+    if not poly:
+        return None, None
+    try:
+        from shapely.geometry import Polygon
+        p = Polygon(poly)
+        if not p.is_valid:
+            p = p.buffer(0)
+        return p.area, p.length
+    except Exception:
+        return None, None
